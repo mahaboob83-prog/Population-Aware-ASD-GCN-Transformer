@@ -91,7 +91,7 @@ if __name__ == "__main__":
         num_heads=4,
         num_layers=2,
         feedforward_dim=256,
-        dropout=0.3
+        dropout=0.1
     )
 
     output = model(
