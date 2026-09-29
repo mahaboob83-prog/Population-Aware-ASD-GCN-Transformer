@@ -86,13 +86,10 @@ def build_adaptive_adjacency(x):
 
     similarity = cosine_similarity_matrix(x)
 
-    # Retain non-negative similarity values as continuous
+    # Retain only positive cosine similarities as continuous
     # edge weights.
-    adjacency = torch.clamp(
-        similarity,
-        min=0.0,
-        max=1.0
-    )
+    adjacency = similarity.clone()
+    adjacency[adjacency <= 0] = 0.0
 
     return adjacency, similarity
 
