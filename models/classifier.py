@@ -1,9 +1,9 @@
 """
 MLP classifier for ASD versus typically developing (TD) classification.
 
-The classifier receives the 128-dimensional representations produced
-by the population-level representation learning module and produces
-two class logits corresponding to ASD and TD.
+The classifier follows the BMC Medical Imaging manuscript:
+    128 -> 64 -> 1
+with ReLU, dropout, and sigmoid output.
 """
 
 import torch
@@ -12,44 +12,42 @@ import torch.nn as nn
 
 class ASDClassifier(nn.Module):
     """
-    Multilayer perceptron classifier.
+    Two-layer MLP classifier.
 
     Input:
         [N, 128]
 
     Output:
-        [N, 2]
+        [N, 1]
 
-    Class indices:
-        0 -> TD
-        1 -> ASD
+    Output represents the probability of ASD.
     """
 
     def __init__(
         self,
         input_dim=128,
         hidden_dim=64,
-        num_classes=2,
         dropout=0.3
     ):
         super().__init__()
 
-        self.classifier = nn.Sequential(
-            nn.Linear(
-                input_dim,
-                hidden_dim
-            ),
-            nn.ReLU(),
-
-            nn.Dropout(
-                dropout
-            ),
-
-            nn.Linear(
-                hidden_dim,
-                num_classes
-            )
+        self.fc1 = nn.Linear(
+            input_dim,
+            hidden_dim
         )
+
+        self.relu = nn.ReLU()
+
+        self.dropout = nn.Dropout(
+            dropout
+        )
+
+        self.fc2 = nn.Linear(
+            hidden_dim,
+            1
+        )
+
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
         """
@@ -62,46 +60,58 @@ class ASDClassifier(nn.Module):
         Returns
         -------
         torch.Tensor
-            Class logits:
-            [N, 2]
+            ASD probability:
+            [N, 1]
         """
 
-        return self.classifier(x)
+        x = self.fc1(x)
+
+        x = self.relu(x)
+
+        x = self.dropout(x)
+
+        x = self.fc2(x)
+
+        x = self.sigmoid(x)
+
+        return x
 
 
 if __name__ == "__main__":
 
-    # Simple shape test.
     num_subjects = 20
-    embedding_dim = 128
 
     dummy_input = torch.randn(
         num_subjects,
-        embedding_dim
+        128
     )
 
     model = ASDClassifier(
         input_dim=128,
         hidden_dim=64,
-        num_classes=2,
         dropout=0.3
     )
 
-    logits = model(
+    probability = model(
         dummy_input
     )
 
     print(
-        "Input shape :",
+        "Input shape:",
         dummy_input.shape
     )
 
     print(
         "Output shape:",
-        logits.shape
+        probability.shape
     )
 
     print(
-        "Expected output:",
-        "[N, 2]"
+        "Minimum probability:",
+        probability.min().item()
+    )
+
+    print(
+        "Maximum probability:",
+        probability.max().item()
     )
