@@ -94,9 +94,6 @@ def build_adaptive_adjacency(x):
         max=1.0
     )
 
-    # Add self-loops.
-    adjacency.fill_diagonal_(1.0)
-
     return adjacency, similarity
 
 
