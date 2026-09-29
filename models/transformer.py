@@ -27,7 +27,7 @@ class PopulationTransformer(nn.Module):
         num_heads=4,
         num_layers=2,
         feedforward_dim=256,
-        dropout=0.3
+        dropout=0.1
     ):
         super().__init__()
 
