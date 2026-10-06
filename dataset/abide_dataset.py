@@ -1,141 +1,217 @@
 """
-ABIDE-I dataset loader for structural MRI.
+ABIDE-I structural MRI dataset loader.
 
-Each subject is loaded from a NIfTI file and processed using the
-preprocessing pipeline defined in preprocessing/prepare_abide.py.
+The dataset contains preprocessed 2D structural MRI images.
+Each image is represented as a 224 x 224 grayscale image and
+converted to three channels for the ResNet18 feature extractor.
+
+Labels:
+    0 -> TD
+    1 -> ASD
 
 Pipeline:
+    224 x 224 MRI image
+        -> 3-channel representation
+        -> 49 non-overlapping 32 x 32 patches
 
-    NIfTI MRI
-        -> preprocessing
-        -> 3 x 224 x 224 image
-        -> 49 non-overlapping patches
-        -> 49 x 3 x 32 x 32 patches
-
-The dataset class does not perform model inference, graph
-construction, GCN processing, or Transformer processing.
+The dataset class does not perform:
+    - NIfTI loading
+    - CSV loading
+    - population graph construction
+    - GCN processing
+    - Transformer processing
 """
 
 from pathlib import Path
 
-import pandas as pd
+import numpy as np
 import torch
+from PIL import Image
 from torch.utils.data import Dataset
 
 from preprocessing.create_patches import (
     extract_patches_from_rgb,
 )
-from preprocessing.prepare_abide import (
-    image_to_tensor,
-    preprocess_nifti,
-)
+
+
+IMAGE_SIZE = 224
+PATCH_SIZE = 32
+NUM_PATCHES = 49
 
 
 class ABIDEDataset(Dataset):
     """
-    PyTorch dataset for ABIDE-I structural MRI subjects.
+    Dataset loader for preprocessed ABIDE-I sMRI images.
 
-    Expected metadata columns
-    -------------------------
-    image_path : path to the subject's NIfTI file
-    label      : binary class label
+    Expected directory structure
+    ----------------------------
+    root_dir/
+        ASD/
+            image_001.png
+            image_002.png
+            ...
+        TD/
+            image_003.png
+            image_004.png
+            ...
 
     Labels
     ------
     0 : TD
     1 : ASD
-
-    Returns
-    -------
-    dict
-        image:
-            Tensor of shape [3, 224, 224]
-
-        patches:
-            Tensor of shape [49, 3, 32, 32]
-
-        label:
-            Tensor containing the binary class label
-
-        image_path:
-            Original MRI path
     """
 
-    def __init__(
-        self,
-        dataframe,
-        image_column="image_path",
-        label_column="label",
-        apply_skull_stripping=True,
-        crop=True,
-    ):
+    VALID_EXTENSIONS = {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".bmp",
+        ".tif",
+        ".tiff",
+    }
+
+    CLASS_LABELS = {
+        "TD": 0,
+        "ASD": 1,
+    }
+
+    def __init__(self, root_dir):
         """
         Parameters
         ----------
-        dataframe : pandas.DataFrame
-            DataFrame containing MRI paths and labels.
-
-        image_column : str
-            Name of the column containing NIfTI paths.
-
-        label_column : str
-            Name of the column containing binary labels.
-
-        apply_skull_stripping : bool
-            Whether to use the preprocessing module's
-            skull-stripping step.
-
-        crop : bool
-            Whether to crop background before resizing.
+        root_dir : str or pathlib.Path
+            Root directory containing ASD and TD folders.
         """
 
-        if not isinstance(dataframe, pd.DataFrame):
-            raise TypeError(
-                "dataframe must be a pandas.DataFrame."
+        self.root_dir = Path(root_dir)
+
+        if not self.root_dir.exists():
+            raise FileNotFoundError(
+                f"Dataset directory not found: {self.root_dir}"
             )
 
-        required_columns = {
-            image_column,
-            label_column,
-        }
-
-        missing_columns = (
-            required_columns
-            - set(dataframe.columns)
-        )
-
-        if missing_columns:
+        if not self.root_dir.is_dir():
             raise ValueError(
-                "Missing required columns: "
-                f"{sorted(missing_columns)}"
+                f"Dataset path is not a directory: {self.root_dir}"
             )
 
-        if len(dataframe) == 0:
+        self.samples = []
+
+        self._collect_samples()
+
+        if len(self.samples) == 0:
             raise ValueError(
-                "The dataset dataframe is empty."
+                f"No valid MRI images were found in: {self.root_dir}"
             )
 
-        self.dataframe = dataframe.reset_index(
-            drop=True
-        ).copy()
+    def _collect_samples(self):
+        """
+        Collect image paths and corresponding labels.
+        """
 
-        self.image_column = image_column
-        self.label_column = label_column
-        self.apply_skull_stripping = (
-            apply_skull_stripping
-        )
-        self.crop = crop
+        for class_name, label in self.CLASS_LABELS.items():
+
+            class_dir = self.root_dir / class_name
+
+            if not class_dir.exists():
+                raise FileNotFoundError(
+                    f"Class directory not found: {class_dir}"
+                )
+
+            if not class_dir.is_dir():
+                raise ValueError(
+                    f"Class path is not a directory: {class_dir}"
+                )
+
+            image_files = sorted(
+                [
+                    path
+                    for path in class_dir.iterdir()
+                    if (
+                        path.is_file()
+                        and path.suffix.lower()
+                        in self.VALID_EXTENSIONS
+                    )
+                ]
+            )
+
+            for image_path in image_files:
+                self.samples.append(
+                    (
+                        image_path,
+                        label,
+                    )
+                )
 
     def __len__(self):
         """
         Return the number of subjects.
         """
 
-        return len(self.dataframe)
+        return len(self.samples)
+
+    def _load_image(self, image_path):
+        """
+        Load one preprocessed 2D MRI image.
+
+        Parameters
+        ----------
+        image_path : pathlib.Path
+            Path to the MRI image.
+
+        Returns
+        -------
+        torch.Tensor
+            Tensor with shape [3, 224, 224].
+        """
+
+        try:
+            image = Image.open(image_path).convert("L")
+        except Exception as error:
+            raise RuntimeError(
+                f"Unable to load MRI image: {image_path}"
+            ) from error
+
+        # Ensure the required spatial resolution.
+        if image.size != (
+            IMAGE_SIZE,
+            IMAGE_SIZE,
+        ):
+            image = image.resize(
+                (
+                    IMAGE_SIZE,
+                    IMAGE_SIZE,
+                ),
+                resample=Image.Resampling.BILINEAR,
+            )
+
+        image = np.asarray(
+            image,
+            dtype=np.float32,
+        )
+
+        # Convert pixel intensities to [0, 1].
+        image = image / 255.0
+
+        # Convert grayscale image to three identical channels.
+        image = np.stack(
+            [
+                image,
+                image,
+                image,
+            ],
+            axis=0,
+        )
+
+        image_tensor = torch.from_numpy(
+            image.copy()
+        ).float()
+
+        return image_tensor
 
     def __getitem__(self, index):
         """
-        Load and preprocess one subject.
+        Load one subject and extract its patches.
 
         Parameters
         ----------
@@ -145,65 +221,41 @@ class ABIDEDataset(Dataset):
         Returns
         -------
         dict
-            Processed subject information.
+            image:
+                Tensor of shape [3, 224, 224]
+
+            patches:
+                Tensor of shape [49, 3, 32, 32]
+
+            label:
+                Binary class label
+
+            image_path:
+                Source image path
         """
 
         if not isinstance(index, int):
             index = int(index)
 
-        row = self.dataframe.iloc[index]
-
-        image_path = Path(
-            str(row[self.image_column])
-        )
-
-        if not image_path.exists():
-            raise FileNotFoundError(
-                f"MRI file not found: {image_path}"
+        if index < 0 or index >= len(self.samples):
+            raise IndexError(
+                f"Dataset index out of range: {index}"
             )
 
-        label = int(row[self.label_column])
+        image_path, label = self.samples[index]
 
-        if label not in (0, 1):
-            raise ValueError(
-                f"Expected binary label 0 or 1, got {label}."
-            )
-
-        # -----------------------------------------------------------
-        # MRI preprocessing
-        # -----------------------------------------------------------
-
-        image = preprocess_nifti(
-            image_path,
-            apply_skull_stripping=(
-                self.apply_skull_stripping
-            ),
-            crop=self.crop,
+        image_tensor = self._load_image(
+            image_path
         )
-
-        # -----------------------------------------------------------
-        # Convert image to PyTorch tensor
-        # -----------------------------------------------------------
-
-        image_tensor = image_to_tensor(
-            image
-        )
-
-        # -----------------------------------------------------------
-        # Extract 49 non-overlapping 32x32 patches
-        # -----------------------------------------------------------
 
         patches = extract_patches_from_rgb(
-            image_tensor
+            image_tensor,
+            patch_size=PATCH_SIZE,
         )
-
-        # -----------------------------------------------------------
-        # Subject label
-        # -----------------------------------------------------------
 
         label_tensor = torch.tensor(
             label,
-            dtype=torch.float32
+            dtype=torch.float32,
         )
 
         return {
@@ -213,111 +265,117 @@ class ABIDEDataset(Dataset):
             "image_path": str(image_path),
         }
 
+    def get_labels(self):
+        """
+        Return labels for all subjects.
 
-def create_dataset_from_csv(
-    csv_path,
-    image_column="image_path",
-    label_column="label",
-    apply_skull_stripping=True,
-    crop=True,
-):
-    """
-    Create an ABIDEDataset from a CSV file.
+        Returns
+        -------
+        np.ndarray
+            Integer labels with shape [N].
+        """
 
-    Parameters
-    ----------
-    csv_path : str or pathlib.Path
-        Path to the dataset metadata CSV.
-
-    image_column : str
-        Column containing NIfTI paths.
-
-    label_column : str
-        Column containing binary labels.
-
-    apply_skull_stripping : bool
-        Whether to apply the preprocessing module's
-        skull-stripping step.
-
-    crop : bool
-        Whether to crop background before resizing.
-
-    Returns
-    -------
-    ABIDEDataset
-        Configured ABIDE-I dataset.
-    """
-
-    csv_path = Path(csv_path)
-
-    if not csv_path.exists():
-        raise FileNotFoundError(
-            f"CSV file not found: {csv_path}"
+        return np.asarray(
+            [
+                label
+                for _, label in self.samples
+            ],
+            dtype=np.int64,
         )
 
-    dataframe = pd.read_csv(
-        csv_path
-    )
+    def get_image_paths(self):
+        """
+        Return image paths for all subjects.
 
-    return ABIDEDataset(
-        dataframe=dataframe,
-        image_column=image_column,
-        label_column=label_column,
-        apply_skull_stripping=apply_skull_stripping,
-        crop=crop,
-    )
+        Returns
+        -------
+        list
+            List of image paths.
+        """
+
+        return [
+            image_path
+            for image_path, _ in self.samples
+        ]
 
 
 if __name__ == "__main__":
 
     # ---------------------------------------------------------------
-    # Dataset structure test
-    # ---------------------------------------------------------------
-    #
-    # This test checks the expected dataframe interface without
-    # requiring the ABIDE-I dataset to be included in the repository.
+    # Dataset test
     # ---------------------------------------------------------------
 
-    test_dataframe = pd.DataFrame(
-        {
-            "image_path": [
-                "subject_001.nii.gz",
-                "subject_002.nii.gz",
-            ],
-            "label": [
-                0,
-                1,
-            ],
-        }
-    )
+    # Change this path to the actual location of your ABIDE-I
+    # preprocessed 2D MRI images before running this test.
+    dataset_root = "E:/ABIDE1"
 
-    dataset = ABIDEDataset(
-        dataframe=test_dataframe,
-        image_column="image_path",
-        label_column="label",
-        apply_skull_stripping=True,
-        crop=True,
-    )
+    try:
 
-    print(
-        "Number of subjects:",
-        len(dataset)
-    )
+        dataset = ABIDEDataset(
+            root_dir=dataset_root
+        )
 
-    print(
-        "Image column:",
-        dataset.image_column
-    )
+        print(
+            "Number of subjects:",
+            len(dataset)
+        )
 
-    print(
-        "Label column:",
-        dataset.label_column
-    )
+        labels = dataset.get_labels()
 
-    assert len(dataset) == 2
+        print(
+            "TD subjects:",
+            int(np.sum(labels == 0))
+        )
 
-    assert dataset.image_column == "image_path"
+        print(
+            "ASD subjects:",
+            int(np.sum(labels == 1))
+        )
 
-    assert dataset.label_column == "label"
+        sample = dataset[0]
 
-    print("ABIDE-I dataset structure test passed.")
+        print(
+            "Image shape:",
+            tuple(sample["image"].shape)
+        )
+
+        print(
+            "Patch shape:",
+            tuple(sample["patches"].shape)
+        )
+
+        print(
+            "Label:",
+            int(sample["label"].item())
+        )
+
+        print(
+            "Image path:",
+            sample["image_path"]
+        )
+
+        assert sample["image"].shape == (
+            3,
+            IMAGE_SIZE,
+            IMAGE_SIZE,
+        )
+
+        assert sample["patches"].shape == (
+            NUM_PATCHES,
+            3,
+            PATCH_SIZE,
+            PATCH_SIZE,
+        )
+
+        assert sample["label"].item() in (0.0, 1.0)
+
+        print("ABIDE-I dataset test passed.")
+
+    except FileNotFoundError as error:
+
+        print(error)
+
+        print(
+            "Update dataset_root to the actual ABIDE-I "
+            "image directory before running the test."
+        )
