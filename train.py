@@ -1,20 +1,21 @@
 """
-Population-Aware ASD Classification Training Pipeline
+Population-Aware ASD Classification Training
 
-Pipeline:
-1. Load ABIDE-I sMRI images from ASD/TD folders.
-2. Perform subject-level stratified 10-fold cross-validation.
-3. Split each development set into training and validation subsets.
-4. Extract 49 non-overlapping 32x32 patches from each 224x224 image.
-5. Extract 512-D patch features using ImageNet-pretrained ResNet18.
-6. Project patch features to 128-D and perform attention-based pooling.
-7. Construct the population graph using training subjects only.
-8. Apply the two-layer GCN.
-9. Apply the population Transformer.
-10. Classify ASD vs TD using the MLP classifier.
-11. Attach validation/test subjects to the training graph only during inference.
-12. Save the best validation checkpoint for each fold.
-13. Report fold-wise and mean +/- SD performance.
+Training protocol:
+- ABIDE-I folder-based sMRI dataset
+- Subject-level stratified 10-fold cross-validation
+- Training / validation / held-out test split
+- ResNet18 patch feature extraction
+- Attention-based subject representation
+- Population graph construction using training subjects
+- Two-layer GCN
+- Two-layer population Transformer
+- MLP classifier
+- Adam optimizer
+- BCE loss
+- ReduceLROnPlateau scheduler
+- Early stopping
+- Mean +/- SD across 10 folds
 
 Labels:
     TD  = 0
@@ -22,21 +23,28 @@ Labels:
 """
 
 import os
+import json
+import csv
 import copy
-import random
-import numpy as np
 
+import numpy as np
 import torch
 import torch.nn as nn
+
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from sklearn.model_selection import StratifiedKFold, train_test_split
+
+from sklearn.model_selection import (
+    StratifiedKFold,
+    train_test_split
+)
+
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
     recall_score,
     f1_score,
-    roc_auc_score,
+    roc_auc_score
 )
 
 from dataset.abide_dataset import ABIDEDataset
@@ -56,13 +64,14 @@ from utils.seed import set_seed
 SEED = 42
 
 DATASET_ROOT = "E:/ABIDE1"
+
+RESULTS_DIR = "results"
 CHECKPOINT_DIR = "checkpoints"
 
 NUM_FOLDS = 10
 
 # IMPORTANT:
-# Set this to the validation proportion actually used
-# in your experiments/manuscript.
+# Use the validation ratio actually used in your experiment.
 VALIDATION_RATIO = 0.10
 
 BATCH_SIZE = 32
@@ -78,18 +87,28 @@ GRADIENT_CLIP_MAX_NORM = 5.0
 SCHEDULER_FACTOR = 0.5
 SCHEDULER_PATIENCE = 5
 
+EMBEDDING_DIM = 128
+
 DEVICE = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )
 
 
 # ============================================================
-# Reproducibility
+# Directories and seed
 # ============================================================
 
-set_seed(SEED)
+os.makedirs(
+    RESULTS_DIR,
+    exist_ok=True
+)
 
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+os.makedirs(
+    CHECKPOINT_DIR,
+    exist_ok=True
+)
+
+set_seed(SEED)
 
 
 # ============================================================
@@ -100,21 +119,17 @@ dataset = ABIDEDataset(
     dataset_root=DATASET_ROOT
 )
 
-labels = np.asarray(dataset.get_labels())
+labels = np.asarray(
+    dataset.get_labels()
+)
 
-num_subjects = len(labels)
+NUM_SUBJECTS = len(labels)
 
-print("=" * 70)
-print("Population-Aware ASD Classification")
-print("=" * 70)
-
-print(f"Device       : {DEVICE}")
-print(f"Subjects     : {num_subjects}")
-print(f"ASD subjects : {np.sum(labels == 1)}")
-print(f"TD subjects  : {np.sum(labels == 0)}")
-print(f"CV folds     : {NUM_FOLDS}")
-print(f"Seed         : {SEED}")
-print("=" * 70)
+print(f"Device: {DEVICE}")
+print(f"Subjects: {NUM_SUBJECTS}")
+print(f"ASD: {np.sum(labels == 1)}")
+print(f"TD: {np.sum(labels == 0)}")
+print(f"Folds: {NUM_FOLDS}")
 
 
 # ============================================================
@@ -122,9 +137,6 @@ print("=" * 70)
 # ============================================================
 
 def create_model():
-    """
-    Create all trainable components of the proposed framework.
-    """
 
     patch_encoder = ResNet18PatchEncoder(
         pretrained=True
@@ -158,43 +170,37 @@ def create_model():
         dropout=0.3
     )
 
-    return (
+    models = (
         patch_encoder,
         subject_representation,
         gcn,
         transformer,
-        classifier,
+        classifier
+    )
+
+    return tuple(
+        model.to(DEVICE)
+        for model in models
     )
 
 
 # ============================================================
-# Device helper
-# ============================================================
-
-def move_models_to_device(models):
-    return tuple(model.to(DEVICE) for model in models)
-
-
-# ============================================================
-# Patch feature extraction
+# Extract subject embeddings
 # ============================================================
 
 def extract_subject_embeddings(
     indices,
     patch_encoder,
-    subject_representation,
+    subject_representation
 ):
     """
-    Extract one 128-D subject-level embedding per subject.
-
-    Returns:
-        Tensor of shape [N, 128]
+    Extract subject-level 128-D embeddings without gradients.
     """
-
-    embeddings = []
 
     patch_encoder.eval()
     subject_representation.eval()
+
+    embeddings = []
 
     with torch.no_grad():
 
@@ -214,20 +220,17 @@ def extract_subject_embeddings(
 
                 patches, _ = dataset[idx]
 
-                # Expected:
-                # [49, 3, 32, 32]
-                patches = patches.to(DEVICE)
-
-                batch_patches.append(patches)
+                batch_patches.append(
+                    patches
+                )
 
             patches = torch.stack(
                 batch_patches,
                 dim=0
-            )
+            ).to(DEVICE)
 
-            # [B, 49, 3, 32, 32]
-            batch_size = patches.size(0)
-            num_patches = patches.size(1)
+            batch_size = patches.shape[0]
+            num_patches = patches.shape[1]
 
             patches = patches.view(
                 batch_size * num_patches,
@@ -236,7 +239,6 @@ def extract_subject_embeddings(
                 32
             )
 
-            # [B*49, 512]
             patch_features = patch_encoder(
                 patches
             )
@@ -247,7 +249,6 @@ def extract_subject_embeddings(
                 512
             )
 
-            # [B, 128]
             subject_features, _ = (
                 subject_representation(
                     patch_features
@@ -255,31 +256,24 @@ def extract_subject_embeddings(
             )
 
             embeddings.append(
-                subject_features.cpu()
+                subject_features
             )
 
     return torch.cat(
         embeddings,
         dim=0
-    ).to(DEVICE)
+    )
 
 
 # ============================================================
-# Trainable subject embedding extraction
+# Extract train embeddings with gradients
 # ============================================================
 
 def extract_train_embeddings(
     indices,
     patch_encoder,
-    subject_representation,
+    subject_representation
 ):
-    """
-    Extract subject-level embeddings while retaining
-    gradients for model training.
-
-    The population graph is constructed from these
-    embeddings during each training epoch.
-    """
 
     embeddings = []
 
@@ -299,17 +293,17 @@ def extract_train_embeddings(
 
             patches, _ = dataset[idx]
 
-            patches = patches.to(DEVICE)
-
-            batch_patches.append(patches)
+            batch_patches.append(
+                patches
+            )
 
         patches = torch.stack(
             batch_patches,
             dim=0
-        )
+        ).to(DEVICE)
 
-        batch_size = patches.size(0)
-        num_patches = patches.size(1)
+        batch_size = patches.shape[0]
+        num_patches = patches.shape[1]
 
         patches = patches.view(
             batch_size * num_patches,
@@ -334,7 +328,9 @@ def extract_train_embeddings(
             )
         )
 
-        embeddings.append(subject_features)
+        embeddings.append(
+            subject_features
+        )
 
     return torch.cat(
         embeddings,
@@ -343,25 +339,13 @@ def extract_train_embeddings(
 
 
 # ============================================================
-# Attach one held-out subject to training graph
+# Attach held-out subject to training population
 # ============================================================
 
 def attach_subject_to_graph(
     training_embeddings,
-    subject_embedding,
+    subject_embedding
 ):
-    """
-    Attach one validation/test subject to the training
-    population graph.
-
-    The training population remains unchanged.
-
-    No validation/test subject is used to construct the
-    original training graph.
-
-    Returns:
-        augmented_normalized_adjacency
-    """
 
     all_embeddings = torch.cat(
         [
@@ -381,121 +365,259 @@ def attach_subject_to_graph(
 
 
 # ============================================================
-# Forward pass for population
+# Validation
 # ============================================================
 
-def population_forward(
-    embeddings,
-    normalized_adjacency,
+def evaluate_validation(
+    val_indices,
+    training_embeddings,
+    patch_encoder,
+    subject_representation,
     gcn,
     transformer,
-    classifier,
+    classifier
 ):
-    """
-    Forward propagation through:
 
-        Subject embedding
-            ↓
-        GCN
-            ↓
-        Transformer
-            ↓
-        Classifier
-    """
+    patch_encoder.eval()
+    subject_representation.eval()
+    gcn.eval()
+    transformer.eval()
+    classifier.eval()
 
-    gcn_features = gcn(
-        embeddings,
-        normalized_adjacency
+    predictions = []
+
+    with torch.no_grad():
+
+        for idx in val_indices:
+
+            patches, _ = dataset[idx]
+
+            patches = patches.to(DEVICE)
+
+            patch_features = patch_encoder(
+                patches
+            )
+
+            patch_features = (
+                patch_features.unsqueeze(0)
+            )
+
+            subject_embedding, _ = (
+                subject_representation(
+                    patch_features
+                )
+            )
+
+            subject_embedding = (
+                subject_embedding.squeeze(0)
+            )
+
+            normalized_adjacency = (
+                attach_subject_to_graph(
+                    training_embeddings,
+                    subject_embedding
+                )
+            )
+
+            all_embeddings = torch.cat(
+                [
+                    training_embeddings,
+                    subject_embedding.unsqueeze(0)
+                ],
+                dim=0
+            )
+
+            gcn_features = gcn(
+                all_embeddings,
+                normalized_adjacency
+            )
+
+            transformer_features = transformer(
+                gcn_features
+            )
+
+            probability = classifier(
+                transformer_features[-1:]
+            ).view(-1)
+
+            predictions.append(
+                probability.item()
+            )
+
+    predicted_labels = (
+        np.asarray(predictions) >= 0.5
+    ).astype(int)
+
+    true_labels = labels[val_indices]
+
+    return accuracy_score(
+        true_labels,
+        predicted_labels
     )
-
-    transformer_features = transformer(
-        gcn_features
-    )
-
-    logits = classifier(
-        transformer_features
-    )
-
-    return logits
 
 
 # ============================================================
-# Training one fold
+# Test evaluation
+# ============================================================
+
+def evaluate_test(
+    train_indices,
+    test_indices,
+    patch_encoder,
+    subject_representation,
+    gcn,
+    transformer,
+    classifier
+):
+
+    patch_encoder.eval()
+    subject_representation.eval()
+    gcn.eval()
+    transformer.eval()
+    classifier.eval()
+
+    training_embeddings = (
+        extract_subject_embeddings(
+            train_indices,
+            patch_encoder,
+            subject_representation
+        )
+    )
+
+    probabilities = []
+
+    with torch.no_grad():
+
+        for idx in test_indices:
+
+            patches, _ = dataset[idx]
+
+            patches = patches.to(DEVICE)
+
+            patch_features = patch_encoder(
+                patches
+            )
+
+            patch_features = (
+                patch_features.unsqueeze(0)
+            )
+
+            subject_embedding, _ = (
+                subject_representation(
+                    patch_features
+                )
+            )
+
+            subject_embedding = (
+                subject_embedding.squeeze(0)
+            )
+
+            normalized_adjacency = (
+                attach_subject_to_graph(
+                    training_embeddings,
+                    subject_embedding
+                )
+            )
+
+            all_embeddings = torch.cat(
+                [
+                    training_embeddings,
+                    subject_embedding.unsqueeze(0)
+                ],
+                dim=0
+            )
+
+            gcn_features = gcn(
+                all_embeddings,
+                normalized_adjacency
+            )
+
+            transformer_features = transformer(
+                gcn_features
+            )
+
+            probability = classifier(
+                transformer_features[-1:]
+            ).view(-1)
+
+            probabilities.append(
+                probability.item()
+            )
+
+    probabilities = np.asarray(
+        probabilities
+    )
+
+    predicted_labels = (
+        probabilities >= 0.5
+    ).astype(int)
+
+    true_labels = labels[test_indices]
+
+    metrics = {
+        "accuracy": accuracy_score(
+            true_labels,
+            predicted_labels
+        ),
+
+        "precision": precision_score(
+            true_labels,
+            predicted_labels,
+            zero_division=0
+        ),
+
+        "recall": recall_score(
+            true_labels,
+            predicted_labels,
+            zero_division=0
+        ),
+
+        "f1": f1_score(
+            true_labels,
+            predicted_labels,
+            zero_division=0
+        ),
+
+        "auc": (
+            roc_auc_score(
+                true_labels,
+                probabilities
+            )
+            if len(np.unique(true_labels)) == 2
+            else np.nan
+        )
+    }
+
+    return metrics
+
+
+# ============================================================
+# Train one fold
 # ============================================================
 
 def train_one_fold(
     fold,
     train_indices,
     val_indices,
-    test_indices,
+    test_indices
 ):
-    """
-    Train one cross-validation fold.
-
-    Graph construction:
-        training subjects only
-
-    Validation/test:
-        attached to training graph only for inference
-    """
-
-    print("\n")
-    print("=" * 70)
-    print(f"FOLD {fold}")
-    print("=" * 70)
-
-    # --------------------------------------------------------
-    # Create models
-    # --------------------------------------------------------
 
     (
         patch_encoder,
         subject_representation,
         gcn,
         transformer,
-        classifier,
+        classifier
     ) = create_model()
-
-    (
-        patch_encoder,
-        subject_representation,
-        gcn,
-        transformer,
-        classifier,
-    ) = move_models_to_device(
-        (
-            patch_encoder,
-            subject_representation,
-            gcn,
-            transformer,
-            classifier,
-        )
-    )
-
-    # --------------------------------------------------------
-    # Loss and optimizer
-    # --------------------------------------------------------
 
     criterion = nn.BCELoss()
 
-    parameters = list(
-        patch_encoder.parameters()
-    )
-
-    parameters += list(
-        subject_representation.parameters()
-    )
-
-    parameters += list(
-        gcn.parameters()
-    )
-
-    parameters += list(
-        transformer.parameters()
-    )
-
-    parameters += list(
-        classifier.parameters()
+    parameters = (
+        list(patch_encoder.parameters())
+        + list(subject_representation.parameters())
+        + list(gcn.parameters())
+        + list(transformer.parameters())
+        + list(classifier.parameters())
     )
 
     optimizer = Adam(
@@ -511,27 +633,15 @@ def train_one_fold(
         patience=SCHEDULER_PATIENCE
     )
 
-    # --------------------------------------------------------
-    # Labels
-    # --------------------------------------------------------
-
     train_labels = torch.tensor(
         labels[train_indices],
         dtype=torch.float32,
         device=DEVICE
     )
 
-    # --------------------------------------------------------
-    # Best checkpoint tracking
-    # --------------------------------------------------------
-
     best_val_accuracy = -np.inf
     best_state = None
-    epochs_without_improvement = 0
-
-    # --------------------------------------------------------
-    # Training loop
-    # --------------------------------------------------------
+    patience_counter = 0
 
     for epoch in range(
         1,
@@ -546,19 +656,13 @@ def train_one_fold(
 
         optimizer.zero_grad()
 
-        # ----------------------------------------------
-        # Extract training subject representations
-        # ----------------------------------------------
-
-        train_embeddings = extract_train_embeddings(
-            train_indices,
-            patch_encoder,
-            subject_representation
+        train_embeddings = (
+            extract_train_embeddings(
+                train_indices,
+                patch_encoder,
+                subject_representation
+            )
         )
-
-        # ----------------------------------------------
-        # Population graph
-        # ----------------------------------------------
 
         _, normalized_adjacency = (
             build_population_graph(
@@ -566,34 +670,18 @@ def train_one_fold(
             )
         )
 
-        # ----------------------------------------------
-        # GCN
-        # ----------------------------------------------
-
         gcn_features = gcn(
             train_embeddings,
             normalized_adjacency
         )
 
-        # ----------------------------------------------
-        # Transformer
-        # ----------------------------------------------
-
         transformer_features = transformer(
             gcn_features
         )
 
-        # ----------------------------------------------
-        # Classifier
-        # ----------------------------------------------
-
         predictions = classifier(
             transformer_features
         ).view(-1)
-
-        # ----------------------------------------------
-        # Training loss
-        # ----------------------------------------------
 
         loss = criterion(
             predictions,
@@ -602,10 +690,6 @@ def train_one_fold(
 
         loss.backward()
 
-        # ----------------------------------------------
-        # Gradient clipping
-        # ----------------------------------------------
-
         torch.nn.utils.clip_grad_norm_(
             parameters,
             max_norm=GRADIENT_CLIP_MAX_NORM
@@ -613,31 +697,27 @@ def train_one_fold(
 
         optimizer.step()
 
-        # ----------------------------------------------
-        # Validation
-        # ----------------------------------------------
-
-        val_accuracy = evaluate_validation(
-            val_indices,
-            train_embeddings.detach(),
-            patch_encoder,
-            subject_representation,
-            gcn,
-            transformer,
-            classifier
+        validation_accuracy = (
+            evaluate_validation(
+                val_indices,
+                train_embeddings.detach(),
+                patch_encoder,
+                subject_representation,
+                gcn,
+                transformer,
+                classifier
+            )
         )
 
         scheduler.step(
-            val_accuracy
+            validation_accuracy
         )
 
-        # ----------------------------------------------
-        # Best model
-        # ----------------------------------------------
+        if validation_accuracy > best_val_accuracy:
 
-        if val_accuracy > best_val_accuracy:
-
-            best_val_accuracy = val_accuracy
+            best_val_accuracy = (
+                validation_accuracy
+            )
 
             best_state = {
                 "patch_encoder":
@@ -668,47 +748,38 @@ def train_one_fold(
                 "epoch": epoch,
 
                 "validation_accuracy":
-                    val_accuracy,
+                    validation_accuracy
             }
 
-            epochs_without_improvement = 0
+            patience_counter = 0
 
         else:
 
-            epochs_without_improvement += 1
+            patience_counter += 1
 
-        # ----------------------------------------------
-        # Progress
-        # ----------------------------------------------
-
-        current_lr = optimizer.param_groups[0]["lr"]
-
-        print(
-            f"Fold {fold:02d} | "
-            f"Epoch {epoch:03d} | "
-            f"Loss {loss.item():.4f} | "
-            f"Val Acc {val_accuracy:.4f} | "
-            f"LR {current_lr:.2e}"
-        )
-
-        # ----------------------------------------------
-        # Early stopping
-        # ----------------------------------------------
-
+        # Minimal progress output
         if (
-            epochs_without_improvement
-            >= EARLY_STOPPING_PATIENCE
+            epoch == 1
+            or epoch % 10 == 0
         ):
 
             print(
-                f"Early stopping at epoch {epoch}"
+                f"Fold {fold}/10 | "
+                f"Epoch {epoch}/{MAX_EPOCHS} | "
+                f"Loss {loss.item():.4f} | "
+                f"Val Acc {validation_accuracy:.4f}"
             )
+
+        if (
+            patience_counter
+            >= EARLY_STOPPING_PATIENCE
+        ):
 
             break
 
-    # ========================================================
-    # Restore best checkpoint
-    # ========================================================
+    # --------------------------------------------------------
+    # Restore best model
+    # --------------------------------------------------------
 
     patch_encoder.load_state_dict(
         best_state["patch_encoder"]
@@ -730,9 +801,13 @@ def train_one_fold(
         best_state["classifier"]
     )
 
+    # --------------------------------------------------------
+    # Save checkpoint
+    # --------------------------------------------------------
+
     checkpoint_path = os.path.join(
         CHECKPOINT_DIR,
-        f"fold_{fold}.pt"
+        f"fold_{fold:02d}.pt"
     )
 
     torch.save(
@@ -740,16 +815,11 @@ def train_one_fold(
         checkpoint_path
     )
 
-    print(
-        f"Best checkpoint saved: "
-        f"{checkpoint_path}"
-    )
+    # --------------------------------------------------------
+    # Test
+    # --------------------------------------------------------
 
-    # ========================================================
-    # Final test evaluation
-    # ========================================================
-
-    test_metrics = evaluate_test(
+    metrics = evaluate_test(
         train_indices,
         test_indices,
         patch_encoder,
@@ -759,343 +829,134 @@ def train_one_fold(
         classifier
     )
 
-    return test_metrics
-
-
-# ============================================================
-# Validation
-# ============================================================
-
-def evaluate_validation(
-    val_indices,
-    training_embeddings,
-    patch_encoder,
-    subject_representation,
-    gcn,
-    transformer,
-    classifier,
-):
-    """
-    Evaluate validation subjects by attaching each validation
-    subject to the training population graph.
-
-    Validation subjects do NOT modify the training graph.
-    """
-
-    patch_encoder.eval()
-    subject_representation.eval()
-    gcn.eval()
-    transformer.eval()
-    classifier.eval()
-
-    predictions = []
-
-    with torch.no_grad():
-
-        for idx in val_indices:
-
-            patches, _ = dataset[idx]
-
-            patches = patches.to(DEVICE)
-
-            # [49, 3, 32, 32]
-            patch_features = patch_encoder(
-                patches
-            )
-
-            # [49, 512]
-            patch_features = patch_features.unsqueeze(0)
-
-            # [1, 128]
-            subject_embedding, _ = (
-                subject_representation(
-                    patch_features
-                )
-            )
-
-            subject_embedding = (
-                subject_embedding.squeeze(0)
-            )
-
-            # ------------------------------------------
-            # Attach validation subject to training graph
-            # ------------------------------------------
-
-            normalized_adjacency = (
-                attach_subject_to_graph(
-                    training_embeddings,
-                    subject_embedding
-                )
-            )
-
-            all_embeddings = torch.cat(
-                [
-                    training_embeddings,
-                    subject_embedding.unsqueeze(0)
-                ],
-                dim=0
-            )
-
-            # ------------------------------------------
-            # GCN
-            # ------------------------------------------
-
-            gcn_features = gcn(
-                all_embeddings,
-                normalized_adjacency
-            )
-
-            # ------------------------------------------
-            # Transformer
-            # ------------------------------------------
-
-            transformer_features = transformer(
-                gcn_features
-            )
-
-            # ------------------------------------------
-            # Last node = validation subject
-            # ------------------------------------------
-
-            test_feature = (
-                transformer_features[-1:]
-            )
-
-            probability = classifier(
-                test_feature
-            ).view(-1)
-
-            predictions.append(
-                probability.item()
-            )
-
-    predicted_labels = (
-        np.asarray(predictions) >= 0.5
-    ).astype(int)
-
-    true_labels = labels[val_indices]
-
-    return accuracy_score(
-        true_labels,
-        predicted_labels
+    metrics["fold"] = fold
+    metrics["best_epoch"] = (
+        best_state["epoch"]
     )
-
-
-# ============================================================
-# Test evaluation
-# ============================================================
-
-def evaluate_test(
-    train_indices,
-    test_indices,
-    patch_encoder,
-    subject_representation,
-    gcn,
-    transformer,
-    classifier,
-):
-    """
-    Evaluate held-out test subjects.
-
-    The training population graph is constructed using
-    training subjects only.
-
-    Each test subject is temporarily attached to that
-    training population during inference.
-    """
-
-    patch_encoder.eval()
-    subject_representation.eval()
-    gcn.eval()
-    transformer.eval()
-    classifier.eval()
-
-    # --------------------------------------------------------
-    # Training subject embeddings
-    # --------------------------------------------------------
-
-    training_embeddings = extract_subject_embeddings(
-        train_indices,
-        patch_encoder,
-        subject_representation
-    )
-
-    probabilities = []
-
-    # --------------------------------------------------------
-    # Test subjects
-    # --------------------------------------------------------
-
-    with torch.no_grad():
-
-        for idx in test_indices:
-
-            patches, _ = dataset[idx]
-
-            patches = patches.to(DEVICE)
-
-            # [49, 512]
-            patch_features = patch_encoder(
-                patches
-            )
-
-            patch_features = (
-                patch_features.unsqueeze(0)
-            )
-
-            # [1, 128]
-            subject_embedding, _ = (
-                subject_representation(
-                    patch_features
-                )
-            )
-
-            subject_embedding = (
-                subject_embedding.squeeze(0)
-            )
-
-            # ------------------------------------------
-            # Attach test subject to training graph
-            # ------------------------------------------
-
-            normalized_adjacency = (
-                attach_subject_to_graph(
-                    training_embeddings,
-                    subject_embedding
-                )
-            )
-
-            all_embeddings = torch.cat(
-                [
-                    training_embeddings,
-                    subject_embedding.unsqueeze(0)
-                ],
-                dim=0
-            )
-
-            # ------------------------------------------
-            # GCN
-            # ------------------------------------------
-
-            gcn_features = gcn(
-                all_embeddings,
-                normalized_adjacency
-            )
-
-            # ------------------------------------------
-            # Transformer
-            # ------------------------------------------
-
-            transformer_features = transformer(
-                gcn_features
-            )
-
-            # ------------------------------------------
-            # Test subject is the final node
-            # ------------------------------------------
-
-            test_feature = (
-                transformer_features[-1:]
-            )
-
-            probability = classifier(
-                test_feature
-            ).view(-1)
-
-            probabilities.append(
-                probability.item()
-            )
-
-    # --------------------------------------------------------
-    # Metrics
-    # --------------------------------------------------------
-
-    probabilities = np.asarray(
-        probabilities
-    )
-
-    predicted_labels = (
-        probabilities >= 0.5
-    ).astype(int)
-
-    true_labels = labels[test_indices]
-
-    accuracy = accuracy_score(
-        true_labels,
-        predicted_labels
-    )
-
-    precision = precision_score(
-        true_labels,
-        predicted_labels,
-        zero_division=0
-    )
-
-    recall = recall_score(
-        true_labels,
-        predicted_labels,
-        zero_division=0
-    )
-
-    f1 = f1_score(
-        true_labels,
-        predicted_labels,
-        zero_division=0
-    )
-
-    if len(np.unique(true_labels)) == 2:
-
-        auc = roc_auc_score(
-            true_labels,
-            probabilities
-        )
-
-    else:
-
-        auc = np.nan
-
-    metrics = {
-        "accuracy": accuracy,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "auc": auc,
-    }
-
-    print(
-        "\nTest Results:"
-    )
-
-    print(
-        f"Accuracy  : {accuracy:.4f}"
-    )
-
-    print(
-        f"Precision : {precision:.4f}"
-    )
-
-    print(
-        f"Recall    : {recall:.4f}"
-    )
-
-    print(
-        f"F1-score  : {f1:.4f}"
-    )
-
-    print(
-        f"AUC       : {auc:.4f}"
+    metrics["best_validation_accuracy"] = (
+        best_state["validation_accuracy"]
     )
 
     return metrics
 
 
 # ============================================================
-# Cross-validation
+# Save fold result
+# ============================================================
+
+def save_fold_result(metrics):
+
+    path = os.path.join(
+        RESULTS_DIR,
+        f"fold_{metrics['fold']:02d}.json"
+    )
+
+    with open(
+        path,
+        "w"
+    ) as file:
+
+        json.dump(
+            metrics,
+            file,
+            indent=4
+        )
+
+
+# ============================================================
+# Save summary CSV
+# ============================================================
+
+def save_summary(results):
+
+    csv_path = os.path.join(
+        RESULTS_DIR,
+        "cross_validation_results.csv"
+    )
+
+    fieldnames = [
+        "fold",
+        "accuracy",
+        "precision",
+        "recall",
+        "f1",
+        "auc",
+        "best_epoch",
+        "best_validation_accuracy"
+    ]
+
+    with open(
+        csv_path,
+        "w",
+        newline=""
+    ) as file:
+
+        writer = csv.DictWriter(
+            file,
+            fieldnames=fieldnames
+        )
+
+        writer.writeheader()
+
+        for result in results:
+
+            writer.writerow(
+                result
+            )
+
+    summary = {}
+
+    for metric in [
+        "accuracy",
+        "precision",
+        "recall",
+        "f1",
+        "auc"
+    ]:
+
+        values = np.asarray(
+            [
+                result[metric]
+                for result in results
+            ],
+            dtype=float
+        )
+
+        summary[metric] = {
+            "mean": float(
+                np.nanmean(values)
+            ),
+            "std": float(
+                np.nanstd(values)
+            )
+        }
+
+    summary_path = os.path.join(
+        RESULTS_DIR,
+        "cross_validation_summary.json"
+    )
+
+    with open(
+        summary_path,
+        "w"
+    ) as file:
+
+        json.dump(
+            summary,
+            file,
+            indent=4
+        )
+
+    return summary
+
+
+# ============================================================
+# 10-fold cross-validation
 # ============================================================
 
 def run_cross_validation():
 
-    all_fold_metrics = []
+    results = []
 
     skf = StratifiedKFold(
         n_splits=NUM_FOLDS,
@@ -1108,15 +969,11 @@ def run_cross_validation():
         test_indices
     ) in enumerate(
         skf.split(
-            np.zeros(num_subjects),
+            np.zeros(NUM_SUBJECTS),
             labels
         ),
         start=1
     ):
-
-        # ----------------------------------------------------
-        # Development -> training + validation
-        # ----------------------------------------------------
 
         development_labels = labels[
             development_indices
@@ -1131,63 +988,39 @@ def run_cross_validation():
             )
         )
 
-        # ----------------------------------------------------
-        # Safety checks
-        # ----------------------------------------------------
-
-        train_set = set(train_indices)
-        val_set = set(val_indices)
-        test_set = set(test_indices)
-
-        assert train_set.isdisjoint(
-            val_set
-        )
-
-        assert train_set.isdisjoint(
-            test_set
-        )
-
-        assert val_set.isdisjoint(
-            test_set
-        )
-
-        # ----------------------------------------------------
-        # Print split information
-        # ----------------------------------------------------
-
-        print("\n")
         print(
-            f"Fold {fold} split:"
+            f"\nFold {fold}/10 | "
+            f"Train: {len(train_indices)} | "
+            f"Val: {len(val_indices)} | "
+            f"Test: {len(test_indices)}"
         )
 
-        print(
-            f"Training   : {len(train_indices)}"
-        )
-
-        print(
-            f"Validation : {len(val_indices)}"
-        )
-
-        print(
-            f"Testing    : {len(test_indices)}"
-        )
-
-        # ----------------------------------------------------
-        # Train fold
-        # ----------------------------------------------------
-
-        fold_metrics = train_one_fold(
+        metrics = train_one_fold(
             fold,
             train_indices,
             val_indices,
             test_indices
         )
 
-        all_fold_metrics.append(
-            fold_metrics
+        results.append(
+            metrics
         )
 
-    return all_fold_metrics
+        save_fold_result(
+            metrics
+        )
+
+        print(
+            f"Fold {fold}/10 | "
+            f"Test Acc: {metrics['accuracy']:.4f} | "
+            f"AUC: {metrics['auc']:.4f}"
+        )
+
+    summary = save_summary(
+        results
+    )
+
+    return results, summary
 
 
 # ============================================================
@@ -1196,46 +1029,28 @@ def run_cross_validation():
 
 if __name__ == "__main__":
 
-    results = run_cross_validation()
+    results, summary = (
+        run_cross_validation()
+    )
 
-    print("\n")
-    print("=" * 70)
-    print("10-FOLD CROSS-VALIDATION RESULTS")
-    print("=" * 70)
+    print("\nFinal 10-fold results")
 
-    metric_names = [
+    for metric in [
         "accuracy",
         "precision",
         "recall",
         "f1",
-        "auc",
-    ]
-
-    for metric in metric_names:
-
-        values = np.asarray(
-            [
-                result[metric]
-                for result in results
-            ],
-            dtype=float
-        )
-
-        mean_value = np.nanmean(
-            values
-        )
-
-        std_value = np.nanstd(
-            values
-        )
+        "auc"
+    ]:
 
         print(
-            f"{metric.capitalize():10s}: "
-            f"{mean_value:.4f} ± {std_value:.4f}"
+            f"{metric}: "
+            f"{summary[metric]['mean']:.4f} "
+            f"+/- "
+            f"{summary[metric]['std']:.4f}"
         )
 
-    print("=" * 70)
-
     print(
-        "\nTraining completed successfully."
+        "\nResults saved to:",
+        RESULTS_DIR
     )
