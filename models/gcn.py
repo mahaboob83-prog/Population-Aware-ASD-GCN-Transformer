@@ -1,14 +1,23 @@
 """
-Graph Convolutional Network for population-level representation learning.
+Two-layer Graph Convolutional Network for population-level
+structural representation learning.
 
-The module implements a two-layer GCN using a symmetrically
-normalized population adjacency matrix:
+The implementation follows the revised manuscript formulation:
 
-    A_tilde = A + I
+    H^(0) = X
 
-    A_hat = D^(-1/2) A_tilde D^(-1/2)
+    H^(1) = ReLU(A_hat H^(0) W^(0))
 
-The input and output node representations are 128-dimensional.
+    Z = A_hat H^(1) W^(1)
+
+where:
+
+    X       : subject-level structural representations
+    A_hat   : symmetrically normalized population adjacency matrix
+    H^(1)   : hidden graph representation
+    Z       : graph-refined subject representation
+
+The input and output representations are 128-dimensional.
 """
 
 import torch
@@ -19,6 +28,10 @@ class GraphConvolution(nn.Module):
     """
     Single graph convolution layer.
 
+    The layer first aggregates information from neighboring
+    subjects using the normalized adjacency matrix and then
+    applies a learnable linear transformation.
+
     Parameters
     ----------
     in_features : int
@@ -28,40 +41,84 @@ class GraphConvolution(nn.Module):
         Output node feature dimension.
     """
 
-    def __init__(self, in_features, out_features):
+    def __init__(
+        self,
+        in_features,
+        out_features
+    ):
         super().__init__()
 
         self.linear = nn.Linear(
             in_features,
-            out_features
+            out_features,
+            bias=False
         )
 
-    def forward(self, x, normalized_adjacency):
+    def forward(
+        self,
+        x,
+        normalized_adjacency
+    ):
         """
         Parameters
         ----------
         x : torch.Tensor
-            Node feature matrix:
-            [N, in_features]
+            Node feature matrix with shape:
+
+                [N, in_features]
 
         normalized_adjacency : torch.Tensor
             Symmetrically normalized adjacency matrix:
-            [N, N]
+
+                [N, N]
 
         Returns
         -------
         torch.Tensor
             Updated node representations:
-            [N, out_features]
+
+                [N, out_features]
         """
 
-        # Aggregate information from neighboring nodes.
+        # -----------------------------------------------------
+        # Validate input dimensions
+        # -----------------------------------------------------
+
+        if x.ndim != 2:
+            raise ValueError(
+                "Expected node features with shape "
+                "[N, in_features]."
+            )
+
+        if normalized_adjacency.ndim != 2:
+            raise ValueError(
+                "Expected normalized adjacency with shape "
+                "[N, N]."
+            )
+
+        if normalized_adjacency.size(0) != x.size(0):
+            raise ValueError(
+                "The number of nodes in the adjacency matrix "
+                "must match the number of nodes in x."
+            )
+
+        # -----------------------------------------------------
+        # Graph neighborhood aggregation
+        #
+        # A_hat X
+        # -----------------------------------------------------
+
         aggregated = torch.matmul(
             normalized_adjacency,
             x
         )
 
-        # Learnable linear transformation.
+        # -----------------------------------------------------
+        # Learnable transformation
+        #
+        # A_hat X W
+        # -----------------------------------------------------
+
         output = self.linear(
             aggregated
         )
@@ -76,49 +133,51 @@ class PopulationGCN(nn.Module):
     Architecture
     ------------
     Input:
-        N x 128 subject-level representations
+        N x 128
 
-    GCN Layer 1:
+    First GCN layer:
         128 -> 128
+        followed by ReLU
 
-    ReLU + Dropout:
-        Dropout = 0.3
-
-    GCN Layer 2:
+    Second GCN layer:
         128 -> 128
 
     Output:
-        N x 128 graph-refined representations
+        N x 128
+
+    The second GCN layer is followed directly by the output,
+    consistent with the mathematical formulation in the
+    revised manuscript.
     """
 
     def __init__(
         self,
         input_dim=128,
         hidden_dim=128,
-        output_dim=128,
-        dropout=0.3
+        output_dim=128
     ):
         super().__init__()
 
-        # First graph convolution layer.
+        # -----------------------------------------------------
+        # First GCN layer
+        # -----------------------------------------------------
+
         self.gcn1 = GraphConvolution(
-            input_dim,
-            hidden_dim
+            in_features=input_dim,
+            out_features=hidden_dim
         )
 
-        # Second graph convolution layer.
+        # -----------------------------------------------------
+        # Second GCN layer
+        # -----------------------------------------------------
+
         self.gcn2 = GraphConvolution(
-            hidden_dim,
-            output_dim
+            in_features=hidden_dim,
+            out_features=output_dim
         )
 
-        # Non-linear activation.
+        # ReLU applied only after the first GCN layer.
         self.activation = nn.ReLU()
-
-        # Dropout specified for the GCN module.
-        self.dropout = nn.Dropout(
-            dropout
-        )
 
     def forward(
         self,
@@ -129,40 +188,47 @@ class PopulationGCN(nn.Module):
         Parameters
         ----------
         x : torch.Tensor
-            Subject-level node features:
-            [N, 128]
+            Subject-level node representations:
+
+                [N, 128]
 
         normalized_adjacency : torch.Tensor
             Symmetrically normalized population graph:
-            [N, N]
+
+                [N, N]
 
         Returns
         -------
         torch.Tensor
-            Graph-refined node representations:
-            [N, output_dim]
+            Graph-refined subject representations:
+
+                [N, 128]
         """
 
-        # First GCN layer.
+        # -----------------------------------------------------
+        # First GCN layer
+        #
+        # H^(1) = ReLU(A_hat H^(0) W^(0))
+        # -----------------------------------------------------
+
         x = self.gcn1(
             x,
             normalized_adjacency
         )
 
-        # Non-linear transformation.
         x = self.activation(x)
 
-        # Dropout after the first GCN layer.
-        x = self.dropout(x)
+        # -----------------------------------------------------
+        # Second GCN layer
+        #
+        # Z = A_hat H^(1) W^(1)
+        # -----------------------------------------------------
 
-        # Second GCN layer.
         x = self.gcn2(
             x,
             normalized_adjacency
         )
 
-        # The second GCN output is returned directly,
-        # following the manuscript formulation.
         return x
 
 
@@ -175,13 +241,16 @@ if __name__ == "__main__":
     num_subjects = 20
     feature_dim = 128
 
-    # Dummy subject-level features.
+    # Dummy subject-level representations.
     dummy_features = torch.randn(
         num_subjects,
         feature_dim
     )
 
-    # Dummy symmetric adjacency matrix.
+    # ---------------------------------------------------------
+    # Create a symmetric dummy adjacency matrix
+    # ---------------------------------------------------------
+
     dummy_adjacency = torch.rand(
         num_subjects,
         num_subjects
@@ -192,7 +261,10 @@ if __name__ == "__main__":
         + dummy_adjacency.t()
     ) / 2.0
 
-    # Add self-loops.
+    # ---------------------------------------------------------
+    # Add self-loops
+    # ---------------------------------------------------------
+
     identity = torch.eye(
         num_subjects
     )
@@ -202,13 +274,19 @@ if __name__ == "__main__":
         + identity
     )
 
-    # Compute node degrees.
+    # ---------------------------------------------------------
+    # Compute node degrees
+    # ---------------------------------------------------------
+
     degree = (
         adjacency_with_self_loops
         .sum(dim=1)
     )
 
-    # Compute D^(-1/2).
+    # ---------------------------------------------------------
+    # Compute D^(-1/2)
+    # ---------------------------------------------------------
+
     degree_inv_sqrt = torch.pow(
         degree,
         -0.5
@@ -218,23 +296,32 @@ if __name__ == "__main__":
         torch.isinf(degree_inv_sqrt)
     ] = 0.0
 
-    # Symmetric normalized adjacency:
-    # D^(-1/2) A D^(-1/2)
+    # ---------------------------------------------------------
+    # Symmetric normalization
+    #
+    # A_hat = D^(-1/2) A_tilde D^(-1/2)
+    # ---------------------------------------------------------
+
     normalized_adjacency = (
         degree_inv_sqrt.unsqueeze(1)
         * adjacency_with_self_loops
         * degree_inv_sqrt.unsqueeze(0)
     )
 
-    # Create the GCN.
+    # ---------------------------------------------------------
+    # Create GCN
+    # ---------------------------------------------------------
+
     model = PopulationGCN(
         input_dim=128,
         hidden_dim=128,
-        output_dim=128,
-        dropout=0.3
+        output_dim=128
     )
 
-    # Forward pass.
+    # ---------------------------------------------------------
+    # Forward pass
+    # ---------------------------------------------------------
+
     output = model(
         dummy_features,
         normalized_adjacency
