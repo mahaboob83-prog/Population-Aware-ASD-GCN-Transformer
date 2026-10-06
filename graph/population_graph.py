@@ -1,20 +1,13 @@
 """
-Adaptive similarity-based population graph construction.
+Population graph construction for subject-level MRI representations.
 
-The graph is constructed from subject-level 128-dimensional
-embeddings using pairwise cosine similarity.
+Each subject is represented by a subject-level embedding. Pairwise
+cosine similarities between subjects are used to construct a weighted
+population graph. Positive cosine similarities are retained as
+continuous edge weights.
 
-The implementation follows the revised manuscript description:
-
-    subject embeddings
-            ↓
-    cosine similarity
-            ↓
-    continuous similarity-based edge weights
-            ↓
-    self-loops
-            ↓
-    symmetric normalized adjacency matrix
+Self-loops are added and the adjacency matrix is symmetrically
+normalized before being supplied to the population GCN.
 """
 
 import torch
@@ -28,22 +21,23 @@ def cosine_similarity_matrix(x):
     Parameters
     ----------
     x : torch.Tensor
-        Subject feature matrix with shape:
-        [N, feature_dim]
+        Subject-level embeddings of shape [N, D].
 
     Returns
     -------
     torch.Tensor
-        Pairwise similarity matrix with shape:
-        [N, N]
+        Pairwise cosine similarity matrix of shape [N, N].
     """
+
+    if not isinstance(x, torch.Tensor):
+        raise TypeError("x must be a torch.Tensor.")
 
     if x.ndim != 2:
         raise ValueError(
-            "Expected input with shape [N, feature_dim]."
+            f"Expected x with shape [N, D], got {tuple(x.shape)}."
         )
 
-    # Normalize each subject embedding.
+    # L2-normalize each subject embedding.
     x_normalized = F.normalize(
         x,
         p=2,
@@ -61,88 +55,117 @@ def cosine_similarity_matrix(x):
 
 def build_adaptive_adjacency(x):
     """
-    Construct a continuous similarity-weighted population graph.
+    Construct the weighted population adjacency matrix.
 
-    Negative cosine similarities are removed so that the adjacency
-    weights lie in the range [0, 1], consistent with the graph
-    formulation used in the revised manuscript and Fig. 6.
+    Positive cosine similarities are retained as continuous edge
+    weights. Non-positive similarities are set to zero.
 
     Parameters
     ----------
     x : torch.Tensor
-        Subject feature matrix:
-        [N, feature_dim]
-
-    Returns
-    -------
-    adjacency : torch.Tensor
-        Weighted adjacency matrix:
-        [N, N]
-
-    similarity : torch.Tensor
-        Original cosine similarity matrix:
-        [N, N]
-    """
-
-    similarity = cosine_similarity_matrix(x)
-
-    # Retain only positive cosine similarities as continuous
-    # edge weights.
-    adjacency = similarity.clone()
-    adjacency[adjacency <= 0] = 0.0
-
-    return adjacency, similarity
-
-
-def normalize_adjacency(adjacency):
-    """
-    Compute the symmetric normalized adjacency matrix.
-
-    A_tilde = A + I
-    D_ii = sum_j A_tilde_ij
-
-    A_hat = D^(-1/2) A_tilde D^(-1/2)
-
-    Parameters
-    ----------
-    adjacency : torch.Tensor
-        Weighted adjacency matrix [N, N].
+        Subject-level embeddings of shape [N, D].
 
     Returns
     -------
     torch.Tensor
-        Symmetrically normalized adjacency matrix [N, N].
+        Weighted adjacency matrix of shape [N, N].
     """
 
-    num_nodes = adjacency.size(0)
+    similarity = cosine_similarity_matrix(x)
+
+    # Retain only positive cosine similarities.
+    adjacency = torch.clamp(
+        similarity,
+        min=0.0
+    )
+
+    # Enforce numerical symmetry.
+    adjacency = 0.5 * (
+        adjacency + adjacency.transpose(0, 1)
+    )
+
+    return adjacency
+
+
+def add_self_loops(adjacency):
+    """
+    Add self-loops to the population graph.
+
+    Parameters
+    ----------
+    adjacency : torch.Tensor
+        Weighted adjacency matrix of shape [N, N].
+
+    Returns
+    -------
+    torch.Tensor
+        Adjacency matrix with self-loops.
+    """
+
+    if not isinstance(adjacency, torch.Tensor):
+        raise TypeError(
+            "adjacency must be a torch.Tensor."
+        )
+
+    if adjacency.ndim != 2:
+        raise ValueError(
+            "Adjacency matrix must be two-dimensional."
+        )
+
+    if adjacency.shape[0] != adjacency.shape[1]:
+        raise ValueError(
+            "Adjacency matrix must be square."
+        )
+
+    num_nodes = adjacency.shape[0]
 
     identity = torch.eye(
         num_nodes,
-        device=adjacency.device,
-        dtype=adjacency.dtype
+        dtype=adjacency.dtype,
+        device=adjacency.device
     )
 
-    # Add self-loops.
-    adjacency_with_self_loops = (
-        adjacency + identity
+    return adjacency + identity
+
+
+def normalize_adjacency(adjacency):
+    """
+    Apply symmetric adjacency normalization.
+
+    The normalization is:
+
+        A_hat = D_tilde^(-1/2)
+                (A + I)
+                D_tilde^(-1/2)
+
+    Parameters
+    ----------
+    adjacency : torch.Tensor
+        Weighted adjacency matrix of shape [N, N].
+
+    Returns
+    -------
+    torch.Tensor
+        Symmetrically normalized adjacency matrix.
+    """
+
+    adjacency_with_loops = add_self_loops(
+        adjacency
     )
 
-    degree = adjacency_with_self_loops.sum(
+    degree = adjacency_with_loops.sum(
         dim=1
     )
 
+    # Numerical stability for non-zero degree values.
     degree_inv_sqrt = torch.pow(
-        degree,
+        degree.clamp_min(1e-12),
         -0.5
     )
 
-    degree_inv_sqrt[
-        torch.isinf(degree_inv_sqrt)
-    ] = 0.0
-
     normalized_adjacency = (
         degree_inv_sqrt.unsqueeze(1)
-        * adjacency_with_self_loops
+        * adjacency_with_loops
         * degree_inv_sqrt.unsqueeze(0)
     )
 
@@ -151,24 +174,23 @@ def normalize_adjacency(adjacency):
 
 def build_population_graph(x):
     """
-    Complete adaptive population graph pipeline.
+    Construct the complete weighted population graph.
 
     Parameters
     ----------
     x : torch.Tensor
-        Subject-level feature matrix:
-        [N, 128]
+        Subject-level embeddings of shape [N, D].
 
     Returns
     -------
     adjacency : torch.Tensor
-        Continuous similarity-weighted adjacency matrix.
+        Weighted population adjacency matrix.
 
     normalized_adjacency : torch.Tensor
-        Normalized adjacency matrix used by the GCN.
+        Symmetrically normalized adjacency matrix for GCN propagation.
     """
 
-    adjacency, _ = build_adaptive_adjacency(x)
+    adjacency = build_adaptive_adjacency(x)
 
     normalized_adjacency = normalize_adjacency(
         adjacency
@@ -179,37 +201,81 @@ def build_population_graph(x):
 
 if __name__ == "__main__":
 
-    # Simple shape test.
-    dummy_features = torch.randn(
-        20,
-        128
+    # ---------------------------------------------------------------
+    # Basic graph construction test
+    # ---------------------------------------------------------------
+
+    num_subjects = 20
+    embedding_dim = 128
+
+    subject_embeddings = torch.randn(
+        num_subjects,
+        embedding_dim
     )
 
-    adjacency, normalized_adjacency = (
-        build_population_graph(dummy_features)
-    )
-
-    print(
-        "Subject feature shape:",
-        dummy_features.shape
-    )
-
-    print(
-        "Adjacency shape:",
-        adjacency.shape
+    adjacency, normalized_adjacency = build_population_graph(
+        subject_embeddings
     )
 
     print(
-        "Normalized adjacency shape:",
-        normalized_adjacency.shape
+        "Subject embedding shape:   ",
+        tuple(subject_embeddings.shape)
     )
 
     print(
-        "Minimum adjacency value:",
-        adjacency.min().item()
+        "Adjacency shape:            ",
+        tuple(adjacency.shape)
     )
 
     print(
-        "Maximum adjacency value:",
-        adjacency.max().item()
+        "Normalized adjacency shape: ",
+        tuple(normalized_adjacency.shape)
     )
+
+    # ---------------------------------------------------------------
+    # Shape checks
+    # ---------------------------------------------------------------
+
+    assert adjacency.shape == (
+        num_subjects,
+        num_subjects
+    )
+
+    assert normalized_adjacency.shape == (
+        num_subjects,
+        num_subjects
+    )
+
+    # ---------------------------------------------------------------
+    # Symmetry checks
+    # ---------------------------------------------------------------
+
+    assert torch.allclose(
+        adjacency,
+        adjacency.transpose(0, 1),
+        atol=1e-6
+    )
+
+    assert torch.allclose(
+        normalized_adjacency,
+        normalized_adjacency.transpose(0, 1),
+        atol=1e-6
+    )
+
+    # ---------------------------------------------------------------
+    # Non-negative edge-weight check
+    # ---------------------------------------------------------------
+
+    assert torch.all(
+        adjacency >= 0
+    )
+
+    # ---------------------------------------------------------------
+    # Diagonal check
+    # ---------------------------------------------------------------
+
+    assert torch.all(
+        adjacency.diagonal() > 0
+    )
+
+    print("Population graph construction test passed.")
